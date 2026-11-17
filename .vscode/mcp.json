@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "ttsc-graph": {
+      "command": "npx",
+      "args": ["-y", "@ttsc/graph"]
+    },
+    "ts-lsp": {
+      "command": "npx",
+      "args": ["-y", "ts-lsp-mcp", "serve"]
+    },
+    "nodejs-debugger": {
+      "command": "npx",
+      "args": ["-y", "@hyperdrive-eng/mcp-nodejs-debugger"]
+    },
+    "npmjs": {
+      "command": "npx",
+      "args": ["-y", "@yawlabs/npmjs-mcp"]
+    }
+  }
+}
