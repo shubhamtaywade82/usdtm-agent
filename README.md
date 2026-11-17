@@ -48,6 +48,55 @@ An LLM (default: `openbmb/minicpm5-2b` via Ollama, configurable) is the brain: i
 3. **Event-driven, not a polling loop.** The agent sleeps until a 5m/15m candle closes, a large liquidation prints (≥ $500k default), or the safety-net timer fires. A cooldown coalesces event storms into single cycles.
 4. **Bounded autonomy.** Max steps per cycle, per-request LLM timeout, tool-call doom-loop detection (same call 4× in 5 min → forced stop), identical-order doom-loop detection (same order 4× in 10 min → reject), and compact tool-result serialization sized for small-context models.
 
+## Systems-Level Control Loop Architecture
+
+At the systems level, this agentic trader is a control loop where a deterministic **harness** (runtime) mediates between a stochastic **model** and external **capabilities** (market data feeds, paper exchange, and memory).
+
+```
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │                      Deterministic Harness (Runtime)                   │
+ │                                                                        │
+ │   Event Coalescer ──► Bounded Cycle Runner ──► Evaluator-Optimizer     │
+ │   (5m/15m kline close,  (Step limits, timeout,  (RiskManager hard      │
+ │    liq spikes, timer)    KV-cache prefix,      gatekeeper, halts,      │
+ │                          doom-loop guards)     invariants)             │
+ └─────────────┬─────────────────────▲─────────────────────┬──────────────┘
+               │ Context             │ Tool Calls          │ State Mutation
+               ▼                     │                     ▼
+ ┌───────────────────────────┐       │         ┌──────────────────────────┐
+ │      Stochastic Model     │───────┘         │  External Capabilities   │
+ │   (Ollama / Local LLM)    │                 │  · Live WS / REST Hub    │
+ │  · ReAct exploration      │                 │  · 17 Domain Tools       │
+ │  · Plan-and-Execute thesis│                 │  · Paper SQLite Engine   │
+ │  · Adaptive order proposal│                 │  · Episodic Reflections  │
+ └───────────────────────────┘                 └──────────────────────────┘
+```
+
+### Where `usdtm-agent` Sits in the Agentic Taxonomy
+
+1. **Hybrid ReAct with Plan-and-Execute Milestones**:
+   - The agent alternates between reasoning and structured tool calls (ReAct) to investigate market overview, order book depth, indicators, and liquidations.
+   - It is bound by an enforced **Plan Milestone**: before any mutating trade can be accepted, it must invoke `set_plan` with an explicit thesis, entry, stop distance, and size rationale.
+2. **Evaluator-Optimizer Mechanical Gate (Generator-Critic)**:
+   - When the stochastic model emits an order (`place_market_order`), it is not directly executed.
+   - The deterministic `RiskManager` evaluates 10 non-negotiable invariants (leverage, notional limits, per-trade stop-loss risk, margin, and order doom-loops).
+   - If rejected, the structured critique is injected back into the conversation context as tool output, enabling the model to adapt and self-correct on the subsequent turn.
+3. **Why Structured Tools Over CodeAct for Financial Execution**:
+   - In live trading, arbitrary script execution introduces unconstrained side-effect risks and bypasses pre-flight risk evaluation. Structured tool calls enforce deterministic schema validation and strict state-mutation checkpoints.
+
+### Production Harness Wiring Mechanics
+
+1. **Tiered Context & Scoped Capabilities**:
+   - Capabilities are cleanly segregated into **Market Data (read)**, **Account (read)**, and **Risk-Gated Execution (write)**. Small models avoid tool hallucination through strict Zod schemas and compact payload serialization.
+2. **Prompt-Cache Prefix Stability**:
+   - LLM engines (Ollama, vLLM, llama.cpp) cache KV prefixes based on token prefix equality. The invariant system prompt and tool schemas form a 100% static prefix. Dynamic state (trigger events, UTC timestamp, and rolling episodic memories) is appended to the user turn at the tail.
+3. **Mechanical Runner Guardrails (Never Prompt-Only)**:
+   - **Max Steps**: Hard ceiling on turns per cycle (`AGENT_MAX_STEPS = 12`).
+   - **Wall-Clock Timeout**: Hard per-turn LLM timeout (`OLLAMA_TIMEOUT_MS = 60000`).
+   - **Duplicate Tool-Call Doom Loop**: Tracks identical `(tool, args)` invocations across a 5-minute rolling window; aborts the cycle at 4 repetitions.
+   - **Order Doom Loop**: Detects identical order specifications within 10 minutes and rejects repeats.
+   - **Side-Effect Gating**: All order execution is gated by the deterministic `RiskManager` circuit breaker (daily loss limits trigger immediate halts).
+
 ## Quick start
 
 ```bash

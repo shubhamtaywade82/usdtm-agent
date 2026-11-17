@@ -78,11 +78,12 @@ export class Agent {
     const memoryBlock = this.memory.length
       ? `\n\nMEMORY (your recent cycle summaries, oldest first):\n${this.memory.map((m, i) => `${i + 1}. ${m}`).join('\n')}`
       : '';
+    // Static system prompt preserves KV-cache prefix; dynamic state is kept in the user turn.
     return [
-      { role: 'system', content: this.systemPrompt() + memoryBlock },
+      { role: 'system', content: this.systemPrompt() },
       {
         role: 'user',
-        content: `Trigger: ${trigger.kind} — ${trigger.detail}\nCurrent UTC time: ${new Date().toISOString()}\nRisk state: ${halt.halted ? `TRADING HALTED (${halt.reason})` : 'normal'}\nUniverse: ${config.symbols.join(', ')}\n\nRun one full decision cycle now.`,
+        content: `Trigger: ${trigger.kind} — ${trigger.detail}\nCurrent UTC time: ${new Date().toISOString()}\nRisk state: ${halt.halted ? `TRADING HALTED (${halt.reason})` : 'normal'}\nUniverse: ${config.symbols.join(', ')}${memoryBlock}\n\nRun one full decision cycle now.`,
       },
     ];
   }
@@ -121,6 +122,23 @@ export class Agent {
     return { name, content: content.length > 4000 ? content.slice(0, 4000) + '…(truncated)' : content };
   }
 
+  private async stepTools(calls: any[], messages: Message[]): Promise<number> {
+    for (const call of calls) {
+      const { name, content } = await this.executeTool(call);
+      messages.push({ role: 'tool', name, content } as unknown as Message);
+    }
+    return calls.length;
+  }
+
+  private finishCycle(
+    kind: CycleTrigger['kind'],
+    summary: string,
+    meta: { steps: number; toolCalls: number; stoppedReason: CycleResult['stoppedReason'] },
+  ): CycleResult {
+    this.addMemory(`[${kind}] ${summary}`);
+    return { summary, steps: meta.steps, toolCalls: meta.toolCalls, ordersPlaced: this.orderCountThisCycle, stoppedReason: meta.stoppedReason };
+  }
+
   async runCycle(trigger: CycleTrigger): Promise<CycleResult> {
     this.orderCountThisCycle = 0;
     this.planNote = '';
@@ -133,7 +151,8 @@ export class Agent {
       try {
         response = await this.callOllama(messages);
       } catch (err: unknown) {
-        return { summary: `LLM call failed: ${err instanceof Error ? err.message : String(err)}`, steps: step, toolCalls: toolCallCount, ordersPlaced: this.orderCountThisCycle, stoppedReason: 'error' };
+        const summary = `LLM call failed: ${err instanceof Error ? err.message : String(err)}`;
+        return { summary, steps: step, toolCalls: toolCallCount, ordersPlaced: this.orderCountThisCycle, stoppedReason: 'error' };
       }
       const msg = response.message;
       if (!msg) return { summary: 'LLM returned no message', steps: step, toolCalls: toolCallCount, ordersPlaced: this.orderCountThisCycle, stoppedReason: 'error' };
@@ -142,23 +161,19 @@ export class Agent {
       const calls = msg.tool_calls ?? [];
       if (calls.length === 0) {
         const summary = (msg.content ?? '').trim() || '(no final message)';
-        this.addMemory(`[${trigger.kind}] ${summary}`);
-        return { summary, steps: step + 1, toolCalls: toolCallCount, ordersPlaced: this.orderCountThisCycle, stoppedReason: 'final_answer' };
+        return this.finishCycle(trigger.kind, summary, { steps: step + 1, toolCalls: toolCallCount, stoppedReason: 'final_answer' });
       }
       if (this.isDoomLoop(calls, toolHistory)) {
         const summary = 'Doom-loop detected: the same tool call repeated 4+ times. Forced stop.';
-        this.addMemory(`[${trigger.kind}] ${summary}`);
-        return { summary, steps: step + 1, toolCalls: toolCallCount, ordersPlaced: this.orderCountThisCycle, stoppedReason: 'doom_loop' };
+        return this.finishCycle(trigger.kind, summary, { steps: step + 1, toolCalls: toolCallCount, stoppedReason: 'doom_loop' });
       }
-      for (const call of calls) {
-        toolCallCount++;
-        const { name, content } = await this.executeTool(call);
-        messages.push({ role: 'tool', name, content } as unknown as Message);
-      }
+      toolCallCount += await this.stepTools(calls, messages);
     }
-    const summary = 'Max steps reached without a final answer.';
-    this.addMemory(`[${trigger.kind}] ${summary}`);
-    return { summary, steps: config.ollama.maxSteps, toolCalls: toolCallCount, ordersPlaced: this.orderCountThisCycle, stoppedReason: 'max_steps' };
+    return this.finishCycle(trigger.kind, 'Max steps reached without a final answer.', {
+      steps: config.ollama.maxSteps,
+      toolCalls: toolCallCount,
+      stoppedReason: 'max_steps',
+    });
   }
 
   private callOllama(messages: Message[]): Promise<any> {
