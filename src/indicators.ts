@@ -16,12 +16,14 @@ export function ema(values: number[], period: number): number[] {
 export function rsi(closes: number[], period = 14): number[] {
   if (closes.length < period + 1) return [];
   const out: number[] = [];
-  let gains = 0, losses = 0;
+  let gains = 0;
+  let losses = 0;
   for (let i = 1; i <= period; i++) {
     const d = closes[i] - closes[i - 1];
     if (d >= 0) gains += d; else losses -= d;
   }
-  let avgGain = gains / period, avgLoss = losses / period;
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
   out.push(avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss));
   for (let i = period + 1; i < closes.length; i++) {
     const d = closes[i] - closes[i - 1];
@@ -48,7 +50,8 @@ export function atr(highs: number[], lows: number[], closes: number[], period = 
 }
 
 export function vwap(klines: { high: number; low: number; close: number; volume: number }[]): number {
-  let pv = 0, vol = 0;
+  let pv = 0;
+  let vol = 0;
   for (const k of klines) {
     const tp = (k.high + k.low + k.close) / 3;
     pv += tp * k.volume;
@@ -61,7 +64,6 @@ export function macd(closes: number[], fast = 12, slow = 26, signal = 9) {
   if (closes.length < slow + signal) return null;
   const ef = ema(closes, fast);
   const es = ema(closes, slow);
-  // Align tails.
   const offset = es.length - ef.length;
   const line: number[] = [];
   for (let i = 0; i < ef.length; i++) {
@@ -108,6 +110,22 @@ export interface IndicatorSnapshot {
   momentum: 'STRONG_UP' | 'UP' | 'NEUTRAL' | 'DOWN' | 'STRONG_DOWN';
 }
 
+function classifyTrend(e9: number | null, e21: number | null): 'UP' | 'DOWN' | 'FLAT' {
+  if (e9 === null || e21 === null) return 'FLAT';
+  if (e9 > e21 * 1.0005) return 'UP';
+  if (e9 < e21 * 0.9995) return 'DOWN';
+  return 'FLAT';
+}
+
+function classifyMomentum(r14: number | null): IndicatorSnapshot['momentum'] {
+  if (r14 === null) return 'NEUTRAL';
+  if (r14 >= 65) return 'STRONG_UP';
+  if (r14 >= 55) return 'UP';
+  if (r14 <= 35) return 'STRONG_DOWN';
+  if (r14 <= 45) return 'DOWN';
+  return 'NEUTRAL';
+}
+
 export function snapshot(interval: string, klines: {
   high: number; low: number; close: number; volume: number;
 }[]): IndicatorSnapshot | null {
@@ -116,36 +134,26 @@ export function snapshot(interval: string, klines: {
   const highs = klines.map((k) => k.high);
   const lows = klines.map((k) => k.low);
   const lastClose = closes[closes.length - 1];
-  const e9 = ema(closes, 9), e21 = ema(closes, 21), e50 = ema(closes, 50);
+  const e9 = ema(closes, 9);
+  const e21 = ema(closes, 21);
+  const e50 = ema(closes, 50);
   const r14 = rsi(closes, 14);
   const a14 = atr(highs, lows, closes, 14);
-  const ema9 = e9.length ? e9[e9.length - 1] : null;
-  const ema21 = e21.length ? e21[e21.length - 1] : null;
-  const ema50 = e50.length ? e50[e50.length - 1] : null;
-  const rsi14 = r14.length ? r14[r14.length - 1] : null;
   const atr14 = a14.length ? a14[a14.length - 1] : null;
 
-  let trend: IndicatorSnapshot['trend'] = 'FLAT';
-  if (ema9 !== null && ema21 !== null) {
-    if (ema9 > ema21 * 1.0005) trend = 'UP';
-    else if (ema9 < ema21 * 0.9995) trend = 'DOWN';
-  }
-  let momentum: IndicatorSnapshot['momentum'] = 'NEUTRAL';
-  if (rsi14 !== null) {
-    if (rsi14 >= 65) momentum = 'STRONG_UP';
-    else if (rsi14 >= 55) momentum = 'UP';
-    else if (rsi14 <= 35) momentum = 'STRONG_DOWN';
-    else if (rsi14 <= 45) momentum = 'DOWN';
-  }
   return {
     interval,
     lastClose,
-    ema9, ema21, ema50, rsi14,
+    ema9: e9.length ? e9[e9.length - 1] : null,
+    ema21: e21.length ? e21[e21.length - 1] : null,
+    ema50: e50.length ? e50[e50.length - 1] : null,
+    rsi14: r14.length ? r14[r14.length - 1] : null,
     atr14,
     atrPct: atr14 !== null && lastClose > 0 ? (atr14 / lastClose) * 100 : null,
     macd: macd(closes),
     bollinger: bollinger(closes),
     vwap: vwap(klines.slice(-30)),
-    trend, momentum,
+    trend: classifyTrend(e9.length ? e9[e9.length - 1] : null, e21.length ? e21[e21.length - 1] : null),
+    momentum: classifyMomentum(r14.length ? r14[r14.length - 1] : null),
   };
 }

@@ -1,14 +1,7 @@
 /**
- * Agent — the ReAct-style tool-calling loop over Ollama.
- *
- * Production control patterns built in:
- *  - Bounded execution: max steps, per-request timeout.
- *  - Doom-loop detection: identical tool calls repeated → forced stop.
- *  - Event context injection: the triggering event (kline close / liquidation /
- *    schedule) is stated in the user message so the model reacts to it.
- *  - Memory: the last N cycle summaries are injected as system context.
+ * Agent — ReAct tool-calling loop over Ollama with bounded execution and memory.
  */
-import { Ollama } from 'ollama';
+import { Ollama, type Message } from 'ollama';
 import { config } from './config.js';
 import { createTools, toOllamaTools, type ToolContext } from './tools.js';
 
@@ -24,6 +17,8 @@ export interface CycleResult {
   ordersPlaced: number;
   stoppedReason: 'final_answer' | 'max_steps' | 'doom_loop' | 'error';
 }
+
+interface ToolCallEntry { name: string; argsKey: string; at: number; }
 
 const SYSTEM_PROMPT = `You are a disciplined autonomous crypto trading agent running a USDT-M perpetual futures PAPER account.
 
@@ -51,7 +46,6 @@ export class Agent {
   private toolDefs: ReturnType<typeof toOllamaTools>;
   private orderCountThisCycle = 0;
   private planNote = '';
-  /** Rolling memory of past cycle summaries. */
   private memory: string[] = [];
   private static readonly MEMORY_DEPTH = 5;
 
@@ -79,44 +73,70 @@ export class Agent {
       .replace('${DAILY}', String(config.paper.dailyLossLimitPct));
   }
 
-  async runCycle(trigger: CycleTrigger): Promise<CycleResult> {
-    const marks = this.ctx.markPrices();
+  private buildInitialMessages(trigger: CycleTrigger): Message[] {
     const halt = this.ctx.risk.isHalted();
-    this.orderCountThisCycle = 0;
-    this.planNote = '';
-
     const memoryBlock = this.memory.length
       ? `\n\nMEMORY (your recent cycle summaries, oldest first):\n${this.memory.map((m, i) => `${i + 1}. ${m}`).join('\n')}`
       : '';
-
-    const messages: any[] = [
+    return [
       { role: 'system', content: this.systemPrompt() + memoryBlock },
       {
         role: 'user',
-        content: `Trigger: ${trigger.kind} — ${trigger.detail}
-Current UTC time: ${new Date().toISOString()}
-Risk state: ${halt.halted ? `TRADING HALTED (${halt.reason})` : 'normal'}
-Universe: ${config.symbols.join(', ')}
-
-Run one full decision cycle now.`,
+        content: `Trigger: ${trigger.kind} — ${trigger.detail}\nCurrent UTC time: ${new Date().toISOString()}\nRisk state: ${halt.halted ? `TRADING HALTED (${halt.reason})` : 'normal'}\nUniverse: ${config.symbols.join(', ')}\n\nRun one full decision cycle now.`,
       },
     ];
+  }
 
-    const recentToolCalls: { name: string; argsKey: string; at: number }[] = [];
+  private isDoomLoop(calls: any[], history: ToolCallEntry[]): boolean {
+    const now = Date.now();
+    for (const c of calls) {
+      const name = c.function?.name ?? '?';
+      const argsKey = typeof c.function?.arguments === 'string' ? c.function.arguments : JSON.stringify(c.function?.arguments ?? {});
+      history.push({ name, argsKey, at: now });
+    }
+    const window = history.filter((t) => now - t.at < 5 * 60_000);
+    const countIdentical = (t: ToolCallEntry) => window.filter((o) => o.name === t.name && o.argsKey === t.argsKey).length;
+    return window.some((t) => countIdentical(t) >= 4);
+  }
+
+  private async executeTool(call: any): Promise<{ name: string; content: string }> {
+    const name = call.function?.name ?? '';
+    let args: Record<string, unknown> = {};
+    if (typeof call.function?.arguments === 'string') {
+      try { args = JSON.parse(call.function.arguments); } catch { args = { unparsed: call.function.arguments }; }
+    } else {
+      args = call.function?.arguments ?? {};
+    }
+    if (name === 'place_market_order' || name === 'close_position') this.orderCountThisCycle++;
+
+    let result: unknown;
+    try {
+      const tool = this.tools[name];
+      result = tool ? await tool.execute(args) : { error: `unknown tool: ${name}` };
+    } catch (err: unknown) {
+      result = { error: err instanceof Error ? err.message : String(err) };
+    }
+    let content: string;
+    try { content = JSON.stringify(result); } catch { content = JSON.stringify({ error: 'unserializable result' }); }
+    return { name, content: content.length > 4000 ? content.slice(0, 4000) + '…(truncated)' : content };
+  }
+
+  async runCycle(trigger: CycleTrigger): Promise<CycleResult> {
+    this.orderCountThisCycle = 0;
+    this.planNote = '';
+    const messages = this.buildInitialMessages(trigger);
+    const toolHistory: ToolCallEntry[] = [];
     let toolCallCount = 0;
 
     for (let step = 0; step < config.ollama.maxSteps; step++) {
       let response: any;
       try {
         response = await this.callOllama(messages);
-      } catch (err: any) {
-        return { summary: `LLM call failed: ${err.message}`, steps: step, toolCalls: toolCallCount, ordersPlaced: this.orderCountThisCycle, stoppedReason: 'error' };
+      } catch (err: unknown) {
+        return { summary: `LLM call failed: ${err instanceof Error ? err.message : String(err)}`, steps: step, toolCalls: toolCallCount, ordersPlaced: this.orderCountThisCycle, stoppedReason: 'error' };
       }
-
       const msg = response.message;
-      if (!msg) {
-        return { summary: 'LLM returned no message', steps: step, toolCalls: toolCallCount, ordersPlaced: this.orderCountThisCycle, stoppedReason: 'error' };
-      }
+      if (!msg) return { summary: 'LLM returned no message', steps: step, toolCalls: toolCallCount, ordersPlaced: this.orderCountThisCycle, stoppedReason: 'error' };
       messages.push({ role: 'assistant', content: msg.content ?? '', tool_calls: msg.tool_calls });
 
       const calls = msg.tool_calls ?? [];
@@ -125,75 +145,30 @@ Run one full decision cycle now.`,
         this.addMemory(`[${trigger.kind}] ${summary}`);
         return { summary, steps: step + 1, toolCalls: toolCallCount, ordersPlaced: this.orderCountThisCycle, stoppedReason: 'final_answer' };
       }
-
-      // Doom-loop detection on tool calls.
-      const now = Date.now();
-      for (const c of calls) {
-        const name = c.function?.name ?? '?';
-        const argsKey = typeof c.function?.arguments === 'string' ? c.function.arguments : JSON.stringify(c.function?.arguments ?? {});
-        recentToolCalls.push({ name, argsKey, at: now });
-      }
-      const window = recentToolCalls.filter((t) => now - t.at < 5 * 60_000);
-      const identical = (t: { name: string; argsKey: string }) =>
-        window.filter((o) => o.name === t.name && o.argsKey === t.argsKey).length;
-      if (window.some((t) => identical(t) >= 4)) {
-        const summary = 'Doom-loop detected: the same tool call repeated 4+ times. Forced stop. Reassess your approach next cycle.';
+      if (this.isDoomLoop(calls, toolHistory)) {
+        const summary = 'Doom-loop detected: the same tool call repeated 4+ times. Forced stop.';
         this.addMemory(`[${trigger.kind}] ${summary}`);
         return { summary, steps: step + 1, toolCalls: toolCallCount, ordersPlaced: this.orderCountThisCycle, stoppedReason: 'doom_loop' };
       }
-
       for (const call of calls) {
-        const name = call.function?.name ?? '';
         toolCallCount++;
-        let args: any = {};
-        try {
-          args = typeof call.function?.arguments === 'string'
-            ? JSON.parse(call.function.arguments)
-            : (call.function?.arguments ?? {});
-        } catch {
-          args = {};
-        }
-        if (name === 'place_market_order' || name === 'close_position') this.orderCountThisCycle++;
-
-        let result: unknown;
-        try {
-          const tool = (this.tools as any)[name];
-          if (!tool) {
-            result = { error: `unknown tool: ${name}` };
-          } else {
-            result = await tool.execute(args);
-          }
-        } catch (err: any) {
-          result = { error: err.message };
-        }
-        // Compact serialization to protect the small model's context.
-        let content: string;
-        try {
-          content = JSON.stringify(result);
-        } catch {
-          content = JSON.stringify({ error: 'unserializable result' });
-        }
-        if (content.length > 4000) content = content.slice(0, 4000) + '…(truncated)';
-        messages.push({ role: 'tool', name, content });
+        const { name, content } = await this.executeTool(call);
+        messages.push({ role: 'tool', name, content } as unknown as Message);
       }
     }
-
     const summary = 'Max steps reached without a final answer.';
     this.addMemory(`[${trigger.kind}] ${summary}`);
     return { summary, steps: config.ollama.maxSteps, toolCalls: toolCallCount, ordersPlaced: this.orderCountThisCycle, stoppedReason: 'max_steps' };
   }
 
-  private callOllama(messages: any[]): Promise<any> {
+  private callOllama(messages: Message[]): Promise<any> {
     return Promise.race([
       this.ollama.chat({
         model: config.ollama.model,
         messages,
         tools: this.toolDefs,
         stream: false,
-        options: {
-          temperature: config.ollama.temperature,
-          num_ctx: config.ollama.numCtx,
-        },
+        options: { temperature: config.ollama.temperature, num_ctx: config.ollama.numCtx },
       }),
       new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error(`Ollama request timeout after ${config.ollama.requestTimeoutMs}ms`)), config.ollama.requestTimeoutMs),

@@ -1,12 +1,11 @@
 /**
- * RiskManager — the hard risk layer. The LLM proposes; this layer disposes.
- * Every order passes through `checkOrder` and can be rejected regardless of
- * what the agent wants. Circuit breakers trip a trading halt that requires
- * explicit human ack (CLI flag) to clear.
+ * RiskManager — the hard risk layer. Proposes guardrails and order rejections
+ * before execution on PaperExchange.
  */
+import { Decimal } from 'decimal.js';
 import { config } from './config.js';
 import type { PaperExchange } from './paper-exchange.js';
-import type { PositionSide, Side } from './types.js';
+import type { PaperPosition, Side } from './types.js';
 
 export interface OrderRequest {
   symbol: string;
@@ -21,7 +20,6 @@ export interface OrderRequest {
 export interface RiskCheckResult {
   approved: boolean;
   reason: string;
-  /** Adjusted qty if the original was only marginally too big. */
   adjustedQty?: number;
   checks: { name: string; pass: boolean; detail: string }[];
 }
@@ -37,13 +35,11 @@ export class RiskManager {
 
   constructor(private paper: PaperExchange) {}
 
-  /** Trading halted? (daily loss limit, doom-loop, manual halt) */
   isHalted(): { halted: boolean; reason: string; since: number } {
     this.refreshDailyLoss();
     return { halted: this.halted, reason: this.haltReason, since: this.haltSince };
   }
 
-  /** Manual halt / resume (resume requires ack=true — a deliberate act). */
   setHalt(on: boolean, reason: string, ack = false): void {
     if (on) {
       this.halted = true;
@@ -57,7 +53,7 @@ export class RiskManager {
 
   private refreshDailyLoss(): void {
     const acc = this.paper.getAccount();
-    const dayPnl = acc.equity - acc.dayStartEquity;
+    const dayPnl = new Decimal(acc.equity).minus(acc.dayStartEquity).toNumber();
     const limitPct = config.paper.dailyLossLimitPct / 100;
     if (!this.halted && acc.dayStartEquity > 0 && dayPnl / acc.dayStartEquity <= -limitPct) {
       this.halted = true;
@@ -66,14 +62,13 @@ export class RiskManager {
     }
   }
 
-  /** Doom-loop detection: same (symbol, side, qty) repeatedly within 10 min. */
   private checkDoomLoop(req: OrderRequest): boolean {
     const key = `${req.symbol}:${req.side}:${req.qty.toFixed(8)}:${req.leverage ?? 1}`;
     const now = Date.now();
     this.recentOrders = this.recentOrders.filter((e) => now - e.at < 10 * 60_000);
     const identical = this.recentOrders.filter((e) => e.key === key).length;
     this.recentOrders.push({ key, at: now });
-    return identical >= 3; // 4th identical order within 10 minutes
+    return identical >= 3;
   }
 
   private rateLimitOrders(): boolean {
@@ -83,82 +78,78 @@ export class RiskManager {
     return this.ordersLastMinute.length > 20;
   }
 
-  checkOrder(req: OrderRequest, markPrices: Record<string, number>): RiskCheckResult {
-    const checks: { name: string; pass: boolean; detail: string }[] = [];
-    const fail = (reason: string): RiskCheckResult => ({ approved: false, reason, checks });
-    const pass = (): RiskCheckResult => ({ approved: true, reason: 'approved', checks });
-
-    const acc = this.paper.getAccount(markPrices);
-    const positions = this.paper.markPositions(markPrices);
-    const notional = req.qty * req.price;
-
-    // 1. Trading halt
+  private checkBasicSanity(req: OrderRequest, checks: RiskCheckResult['checks']): void {
     this.refreshDailyLoss();
-    const c1 = !this.halted;
-    checks.push({ name: 'trading_halt', pass: c1, detail: this.halted ? this.haltReason : 'ok' });
+    checks.push({ name: 'trading_halt', pass: !this.halted, detail: this.halted ? this.haltReason : 'ok' });
+    const inUniverse = config.symbols.includes(req.symbol);
+    checks.push({ name: 'symbol_universe', pass: inUniverse, detail: inUniverse ? 'ok' : `${req.symbol} not in configured universe` });
+    const finite = req.qty > 0 && req.price > 0 && Number.isFinite(req.qty) && Number.isFinite(req.price);
+    checks.push({ name: 'sanity', pass: finite, detail: finite ? 'ok' : 'qty/price not positive finite' });
+    const levPass = (req.leverage ?? 1) <= config.paper.maxLeverage;
+    checks.push({ name: 'leverage_cap', pass: levPass, detail: `requested ${req.leverage ?? 1}x, cap ${config.paper.maxLeverage}x` });
+  }
 
-    // 2. Symbol in universe
-    const c2 = config.symbols.includes(req.symbol);
-    checks.push({ name: 'symbol_universe', pass: c2, detail: c2 ? 'ok' : `${req.symbol} not in configured universe` });
-
-    // 3. Quantity / price sanity
-    const c3 = req.qty > 0 && req.price > 0 && Number.isFinite(req.qty) && Number.isFinite(req.price);
-    checks.push({ name: 'sanity', pass: c3, detail: c3 ? 'ok' : 'qty/price not positive finite' });
-
-    // 4. Leverage cap
-    const lev = Math.min(req.leverage ?? 1, config.paper.maxLeverage);
-    const c4 = (req.leverage ?? 1) <= config.paper.maxLeverage;
-    checks.push({ name: 'leverage_cap', pass: c4, detail: `requested ${req.leverage ?? 1}x, cap ${config.paper.maxLeverage}x` });
-
-    // 5. Per-position notional cap (% of equity)
+  private checkNotionalCaps(
+    ctx: { req: OrderRequest; notional: number; acc: { equity: number }; positions: PaperPosition[]; markPrices: Record<string, number> },
+    checks: RiskCheckResult['checks']
+  ): void {
+    const { req, notional, acc, positions, markPrices } = ctx;
     const sameSym = positions.find((p) => p.symbol === req.symbol);
     const increasingExisting = !!sameSym && sameSym.side === (req.side === 'BUY' ? 'LONG' : 'SHORT');
     const projectedNotional = increasingExisting ? sameSym.qty * markPrices[sameSym.symbol] + notional : notional;
     const posCap = acc.equity * (config.paper.maxPositionNotionalPct / 100);
-    const c5 = projectedNotional <= posCap;
-    checks.push({ name: 'position_notional_cap', pass: c5, detail: `projected $${projectedNotional.toFixed(0)} vs cap $${posCap.toFixed(0)}` });
+    checks.push({ name: 'position_notional_cap', pass: projectedNotional <= posCap, detail: `projected $${projectedNotional.toFixed(0)} vs cap $${posCap.toFixed(0)}` });
 
-    // 6. Portfolio notional cap
     const totalProjected = positions.reduce((s, p) => s + (markPrices[p.symbol] ?? p.entryPrice) * p.qty, 0) + (increasingExisting ? notional : 0);
     const portCap = acc.equity * (config.paper.maxPortfolioNotionalPct / 100);
-    const c6 = totalProjected <= portCap;
-    checks.push({ name: 'portfolio_notional_cap', pass: c6, detail: `projected $${totalProjected.toFixed(0)} vs cap $${portCap.toFixed(0)}` });
+    checks.push({ name: 'portfolio_notional_cap', pass: totalProjected <= portCap, detail: `projected $${totalProjected.toFixed(0)} vs cap $${portCap.toFixed(0)}` });
+  }
 
-    // 7. Margin availability (incl. fee)
+  private checkMarginAndRisk(
+    ctx: { req: OrderRequest; notional: number; acc: { equity: number; available: number }; sameSym?: PaperPosition },
+    checks: RiskCheckResult['checks']
+  ): void {
+    const { req, notional, acc, sameSym } = ctx;
+    const lev = Math.min(req.leverage ?? 1, config.paper.maxLeverage);
     const fee = notional * (config.paper.takerFeeBps / 10_000);
     const required = notional / lev + fee;
-    const c7 = required <= acc.available;
-    checks.push({ name: 'margin_available', pass: c7, detail: `need $${required.toFixed(2)}, available $${acc.available.toFixed(2)}` });
+    checks.push({ name: 'margin_available', pass: required <= acc.available, detail: `need $${required.toFixed(2)}, available $${acc.available.toFixed(2)}` });
 
-    // 8. Per-trade risk cap (if stop distance given)
-    let c8 = true;
-    let c8detail = 'no stop distance given (opening without stop — allowed but discouraged)';
+    let riskPass = true;
+    let riskDetail = 'no stop distance given (opening without stop — allowed but discouraged)';
     const isReduce = !!sameSym && sameSym.side !== (req.side === 'BUY' ? 'LONG' : 'SHORT');
     if (!isReduce && req.stopDistancePct != null && req.stopDistancePct > 0) {
       const riskUsd = notional * (req.stopDistancePct / 100);
       const riskCap = acc.equity * (config.paper.maxRiskPerTradePct / 100);
-      c8 = riskUsd <= riskCap * 1.05; // 5% tolerance
-      c8detail = `risk $${riskUsd.toFixed(2)} vs cap $${riskCap.toFixed(2)}`;
+      riskPass = riskUsd <= riskCap * 1.05;
+      riskDetail = `risk $${riskUsd.toFixed(2)} vs cap $${riskCap.toFixed(2)}`;
     }
-    checks.push({ name: 'per_trade_risk_cap', pass: c8, detail: c8detail });
+    checks.push({ name: 'per_trade_risk_cap', pass: riskPass, detail: riskDetail });
+    const noDoom = !this.checkDoomLoop(req);
+    checks.push({ name: 'doom_loop', pass: noDoom, detail: noDoom ? 'ok' : 'identical order repeated ≥3× in 10min' });
+    const notRateLimited = !this.rateLimitOrders();
+    checks.push({ name: 'order_rate_limit', pass: notRateLimited, detail: notRateLimited ? 'ok' : '>20 orders/min' });
+  }
 
-    // 9. Doom-loop
-    const c9 = !this.checkDoomLoop(req);
-    checks.push({ name: 'doom_loop', pass: c9, detail: c9 ? 'ok' : 'identical order repeated ≥3× in 10min' });
+  checkOrder(req: OrderRequest, markPrices: Record<string, number>): RiskCheckResult {
+    const checks: RiskCheckResult['checks'] = [];
+    const acc = this.paper.getAccount(markPrices);
+    const positions = this.paper.markPositions(markPrices);
+    const notional = req.qty * req.price;
+    const sameSym = positions.find((p) => p.symbol === req.symbol);
 
-    // 10. Order rate limit
-    const c10 = !this.rateLimitOrders();
-    checks.push({ name: 'order_rate_limit', pass: c10, detail: c10 ? 'ok' : '>20 orders/min' });
+    this.checkBasicSanity(req, checks);
+    this.checkNotionalCaps({ req, notional, acc, positions, markPrices }, checks);
+    this.checkMarginAndRisk({ req, notional, acc, sameSym }, checks);
 
     const allPass = checks.every((c) => c.pass);
     if (!allPass) {
       const failed = checks.filter((c) => !c.pass).map((c) => `${c.name}(${c.detail})`).join('; ');
-      return fail(`RISK REJECTED: ${failed}`);
+      return { approved: false, reason: `RISK REJECTED: ${failed}`, checks };
     }
-    return pass();
+    return { approved: true, reason: 'approved', checks };
   }
 
-  /** Suggest a maximum qty for an opening order given current equity and caps. */
   maxQtyFor(symbol: string, price: number, leverage: number, markPrices: Record<string, number>): number {
     const acc = this.paper.getAccount(markPrices);
     const posCap = acc.equity * (config.paper.maxPositionNotionalPct / 100);
