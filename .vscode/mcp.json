@@ -1,20 +1,29 @@
 {
-  "mcpServers": {
+  "servers": {
+    "skel": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["--yes", "skel-mcp@0.2.0"]
+    },
+    "ts-lsp-mcp": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "ts-lsp-mcp", "serve", "--stdio"]
+    },
     "ttsc-graph": {
+      "type": "stdio",
       "command": "npx",
       "args": ["-y", "@ttsc/graph"]
     },
-    "ts-lsp": {
+    "npm-helper": {
+      "type": "stdio",
       "command": "npx",
-      "args": ["-y", "ts-lsp-mcp", "serve"]
+      "args": ["-y", "@pinkpixel/npm-helper-mcp"]
     },
     "nodejs-debugger": {
+      "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@hyperdrive-eng/mcp-nodejs-debugger"]
-    },
-    "npmjs": {
-      "command": "npx",
-      "args": ["-y", "@yawlabs/npmjs-mcp"]
+      "args": ["@hyperdrive-eng/mcp-nodejs-debugger"]
     }
   }
 }

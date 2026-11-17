@@ -1,0 +1,27 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "skel": {
+        "command": "npx",
+        "args": ["--yes", "skel-mcp@0.2.0"]
+      },
+      "ts-lsp-mcp": {
+        "command": "npx",
+        "args": ["-y", "ts-lsp-mcp", "serve", "--stdio"]
+      },
+      "ttsc-graph": {
+        "command": "npx",
+        "args": ["-y", "@ttsc/graph"]
+      },
+      "npm-helper": {
+        "command": "npx",
+        "args": ["-y", "@pinkpixel/npm-helper-mcp"]
+      },
+      "nodejs-debugger": {
+        "command": "npx",
+        "args": ["@hyperdrive-eng/mcp-nodejs-debugger"]
+      }
+    }
+  }
+}
