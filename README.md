@@ -1,0 +1,144 @@
+# Agentic USDT-M Futures Paper Trader
+
+A fully agentic, autonomous crypto trading agent for **Binance USDT-M perpetual futures**, running entirely on **public market data** (no API keys, no account endpoints) and executing against a local **paper exchange** with a hard risk layer.
+
+An LLM (default: `openbmb/minicpm5-2b` via Ollama, configurable) is the brain: it wakes on market events, investigates with tools, states a plan, and places orders — all through a ReAct-style tool-calling loop.
+
+```
+        ┌────────────────────────────────────────────────────────────┐
+        │                     Binance USDT-M (public)                │
+        │   WS: aggTrade, klines, bookTicker, markPrice, ticker,     │
+        │       forceOrder (liquidations), depth diffs  +  REST hist │
+        └───────────────┬────────────────────────────┬───────────────┘
+                        │ WebSocket (primary)        │ REST (cached fallback)
+                        ▼                            ▼
+                ┌──────────────────────────────────────────┐
+                │            MarketDataHub                 │
+                │  live prices · L2 books · klines ·       │
+                │  funding · liquidations · ratios         │
+                └───────────────┬──────────────────────────┘
+                                │ events
+                ┌───────────────▼───────────────┐
+                │   Event-driven Runner         │  kline close / big liq /
+                │   (cooldown + coalescing)     │  schedule → wake agent
+                └───────────────┬───────────────┘
+                                ▼
+                ┌───────────────────────────────┐
+                │      Agent (ReAct loop)       │  Ollama LLM + 17 tools
+                │  bounded steps · doom-loop    │
+                │  detection · memory           │
+                └───────────────┬───────────────┘
+                        proposes │
+                                ▼
+                ┌───────────────────────────────┐
+                │      RiskManager (hard)       │  leverage / notional / risk
+                │  circuit breakers · halts     │  caps / doom-loop / rate
+                └───────────────┬───────────────┘
+                     approves ▼
+                ┌───────────────────────────────┐
+                │  PaperExchange (SQLite)       │  margin · fees · funding ·
+                │                               │  liquidations · persistence
+                └───────────────────────────────┘
+```
+
+## Design principles
+
+1. **WebSocket-first.** All live data (prices, book, mark price, klines, liquidations) arrives over WS through `@nemesis-oss/binance-sdk`'s pooled connections. REST is only a cached fallback for history endpoints, wrapped in hard timeouts so a rate-limited REST never stalls an agent cycle. (This matters: Binance actively bans REST-poling IPs and its own error message says "use the websocket for live updates".)
+2. **The LLM proposes; the risk layer disposes.** Every order passes `RiskManager.checkOrder()` — leverage caps, per-symbol and portfolio notional caps, per-trade risk caps (stop-distance-based), margin checks, doom-loop detection, order rate limits, and a daily-loss circuit breaker. A halted account can only resume via explicit acknowledge.
+3. **Event-driven, not a polling loop.** The agent sleeps until a 5m/15m candle closes, a large liquidation prints (≥ $500k default), or the safety-net timer fires. A cooldown coalesces event storms into single cycles.
+4. **Bounded autonomy.** Max steps per cycle, per-request LLM timeout, tool-call doom-loop detection (same call 4× in 5 min → forced stop), identical-order doom-loop detection (same order 4× in 10 min → reject), and compact tool-result serialization sized for small-context models.
+
+## Quick start
+
+```bash
+npm install
+cp .env.example .env        # adjust model / symbols / risk caps
+
+# sanity check (no Ollama needed): 35 checks incl. live WS
+npm run smoke
+
+# agent-loop integration test (mock Ollama, live market data)
+npx tsx src/agent-mock.ts
+
+# run the trader (requires a local Ollama serving a tool-calling model)
+npm start
+
+# single startup cycle then exit
+npm start -- --once
+```
+
+### Requirements
+
+- Node.js ≥ 20
+- [Ollama](https://ollama.com) serving a **tool-calling** model (e.g. `qwen2.5:7b`, `llama3.1:8b`, or the default `openbmb/minicpm5-2b`). Test with: `ollama pull qwen2.5:7b && OLLAMA_MODEL=qwen2.5:7b npm start`
+- Network access to `fstream.binance.com` (WS) and `fapi.binance.com` (REST fallback)
+
+## Configuration (`.env`)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama server |
+| `OLLAMA_MODEL` | `openbmb/minicpm5-2b` | Any tool-calling model |
+| `AGENT_MAX_STEPS` | `12` | Tool-calling steps per cycle |
+| `AGENT_NUM_CTX` | `8192` | Model context window |
+| `SYMBOLS` | `BTCUSDT,ETHUSDT,SOLUSDT` | USDT-M universe |
+| `INITIAL_BALANCE` | `10000` | Paper wallet (USDT) |
+| `MAX_LEVERAGE` | `3` | Hard cap |
+| `MAX_POSITION_NOTIONAL_PCT` | `25` | % of equity per symbol |
+| `MAX_PORTFOLIO_NOTIONAL_PCT` | `80` | % of equity total |
+| `MAX_RISK_PER_TRADE_PCT` | `1.5` | stop distance × qty, % of equity |
+| `DAILY_LOSS_LIMIT_PCT` | `5` | trips the trading halt |
+| `MAKER_FEE_BPS` / `TAKER_FEE_BPS` | `2` / `5` | Paper fees |
+| `KLINE_TRIGGER_INTERVALS` | `5m,15m` | Candle-close wake-ups |
+| `LIQUIDATION_NOTIONAL_USD` | `500000` | Big-liq wake-up threshold |
+| `CYCLE_MINUTES` | `15` | Safety-net cycle |
+| `COOLDOWN_SECONDS` | `45` | Min gap between cycles |
+| `REST_TIMEOUT_MS` | `8000` | Hard cap on any REST fallback call |
+
+## Agent tools (17)
+
+**Market data (read, live):** `get_live_price`, `get_24h_ticker`, `get_klines`, `get_indicators` (EMA/RSI/ATR/MACD/Bollinger/VWAP/trend classification), `get_order_book` (live L2), `get_mark_price_funding`, `get_funding_history`, `get_open_interest` (+ history), `get_long_short_ratio` (global/top-trader/taker), `get_recent_liquidations`, `get_market_overview`, `get_symbol_rules`.
+
+**Account (read):** `get_portfolio` (equity, margin, positions, liq prices), `get_recent_orders`.
+
+**Trading (write, risk-gated):** `set_plan` (required before orders), `place_market_order`, `close_position`.
+
+## Paper exchange semantics
+
+- One-way positions per symbol (LONG or SHORT), leverage, isolated-style margin.
+- Fills at the live WS mid price; taker fee on notional (bps configurable).
+- **Funding** settled every 8h from the live WS funding rate (LONG pays positive funding).
+- **Liquidation** when mark price crosses the estimated liquidation price (maintenance-margin approximation); position force-closed, PnL realized.
+- Everything persisted in SQLite (`data/paper.db`): account, positions, orders (with the agent's stated reason), funding payments, equity curve. State survives restarts.
+
+## Risk layer (hard limits)
+
+`checkOrder` runs 10 checks: trading halt, symbol universe, sanity, leverage cap, per-position notional, portfolio notional, margin availability (incl. fee), per-trade risk cap (when stop distance stated), doom-loop, order rate limit. The **daily-loss circuit breaker** compares equity to day-start equity each cycle and halts all trading at the configured limit. Halts clear only via `RiskManager.setHalt(false, '', /* ack */ true)` — a deliberate act.
+
+## Logging & observability
+
+Console log (emoji-prefixed) covers: hub lifecycle, every cycle trigger + result (steps, tool calls, orders, stop reason, summary), paper fills, funding settlements, paper liquidations, and graceful-shutdown equity. The equity curve is queryable: `SELECT * FROM equity_curve` in `data/paper.db`.
+
+## Project layout
+
+```
+src/
+  config.ts            env parsing, all tunables
+  types.ts             shared domain types (USDT-M only)
+  market-data-hub.ts   WS-first data layer + cached REST fallbacks
+  paper-exchange.ts    paper futures engine (SQLite)
+  indicators.ts        RSI / EMA / ATR / MACD / Bollinger / VWAP
+  risk.ts              hard risk layer + circuit breakers
+  tools.ts             17 agent tools + zod→JSON-Schema
+  agent.ts             ReAct loop, memory, doom-loop detection
+  index.ts             event-driven runner (triggers, maintenance, shutdown)
+  smoke.ts             35-check smoke test (no LLM needed)
+  agent-mock.ts        agent-loop integration test (mock Ollama)
+```
+
+## Notes & limitations
+
+- Paper fills use the WS top-of-book mid; there is no queueing/slippage model (add one in `paper-exchange.ts` if you want more realism).
+- The liquidation price is an approximation using a flat maintenance-margin rate, not Binance's tiered MMR tables.
+- Only USDT-M perpetuals are supported by design; no spot, COIN-M, or options.
+- The system is intentionally **read-only toward Binance**: it subscribes to public streams and calls public REST endpoints only. It cannot touch a real account even if misconfigured.

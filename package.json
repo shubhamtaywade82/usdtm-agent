@@ -1,0 +1,27 @@
+{
+  "name": "usdtm-agentic-paper-trader",
+  "version": "1.0.0",
+  "description": "Fully agentic autonomous USDT-M futures paper-trading system: LLM-driven ReAct loop over Binance USD-M public market data (WebSocket + REST), SQLite persistence, hard risk layer",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "smoke": "tsx src/smoke.ts"
+  },
+  "dependencies": {
+    "@nemesis-oss/binance-sdk": "^3.6.0",
+    "better-sqlite3": "^13.2.0",
+    "ollama": "^0.6.4",
+    "ws": "^8.23.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}
