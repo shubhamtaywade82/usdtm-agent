@@ -27,6 +27,7 @@ async function main(): Promise<void> {
 
   const hub = new MarketDataHub();
   const paper = new PaperExchange();
+  await paper.init();
   const risk = new RiskManager(paper);
 
   const markPrices = (): Record<string, number> => {
@@ -115,11 +116,11 @@ async function main(): Promise<void> {
 
   // ---------------- background maintenance ----------------
   let lastFundingSettleDay = '';
-  const maintenance = setInterval(() => {
+  const maintenance = setInterval(async () => {
     try {
       const marks = markPrices();
       // Liquidation engine.
-      const liqs = paper.checkLiquidations(marks);
+      const liqs = await paper.checkLiquidations(marks);
       for (const l of liqs) log('💥', `PAPER LIQUIDATION on ${l.symbol}, realizedPnl=${l.realizedPnl.toFixed(2)}`);
       // Funding settlement every 8h at :00/:08/:16 (approximation of Binance's schedule).
       const now = new Date();
@@ -130,7 +131,7 @@ async function main(): Promise<void> {
         for (const s of config.symbols) {
           const mp = hub.getMarkPrice(s);
           if (mp && paper.getPosition(s)) {
-            const amount = paper.settleFunding(s, mp.fundingRate, mp.markPrice);
+            const amount = await paper.settleFunding(s, mp.fundingRate, mp.markPrice);
             log('🪙', `funding settled ${s}: ${amount.toFixed(4)} USDT (rate ${(mp.fundingRate * 100).toFixed(4)}%)`);
           }
         }
@@ -158,7 +159,7 @@ async function main(): Promise<void> {
     const acc = paper.getAccount(marks);
     log('💰', `final equity: ${acc.equity.toFixed(2)} USDT (day PnL ${(acc.equity - acc.dayStartEquity).toFixed(2)})`);
     await hub.stop();
-    paper.close();
+    await paper.close();
     process.exit(0);
   };
   process.on('SIGINT', () => void shutdown('SIGINT'));

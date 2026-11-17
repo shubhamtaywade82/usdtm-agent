@@ -43,7 +43,10 @@ export const config = {
   },
   symbols: envList('SYMBOLS', ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']),
   paper: {
-    dbPath: path.resolve(process.cwd(), envStr('DB_PATH', 'data/paper.db')),
+    baseUrl: envStr('PAPER_EXCHANGE_URL', 'http://127.0.0.1:3100/api/v1'),
+    apiKey: envStr('PAPER_EXCHANGE_API_KEY', 'b9a74aa1e560e92842e308e40391044968709d39c03e97c40d0b39f4eb8f7242'),
+    accountId: envStr('PAPER_EXCHANGE_ACCOUNT_ID', 'usdtm-agent'),
+    holderId: envStr('PAPER_EXCHANGE_HOLDER_ID', 'usdtm-agent-runner'),
     initialBalance: envNum('INITIAL_BALANCE', 10_000),
     /** Hard leverage cap — orders that would exceed it are rejected. */
     maxLeverage: envNum('MAX_LEVERAGE', 3),

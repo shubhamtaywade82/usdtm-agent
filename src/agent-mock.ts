@@ -4,15 +4,11 @@
  * tool results → final answer → memory. Run: npx tsx src/agent-mock.ts
  */
 import http from 'node:http';
-import fs from 'node:fs';
 import { config } from './config.js';
 import { MarketDataHub } from './market-data-hub.js';
 import { PaperExchange } from './paper-exchange.js';
 import { RiskManager } from './risk.js';
 import { Agent } from './agent.js';
-
-const DB = 'data/agent-mock.db';
-for (const suffix of ['', '-wal', '-shm']) fs.rmSync(DB + suffix, { force: true });
 
 // ---- mock Ollama: chat completions with scripted tool calls ----
 const script: any[] = [
@@ -65,7 +61,9 @@ async function main() {
   // simpler: override the agent's host directly after construction.
 
   const hub = new MarketDataHub();
-  const paper = new PaperExchange(DB);
+  const paper = new PaperExchange({ accountId: 'usdtm-agent-mock' });
+  await paper.init();
+  await paper.resetAccount(10000);
   const risk = new RiskManager(paper);
   const markPrices = () => {
     const out: Record<string, number> = {};
@@ -130,7 +128,7 @@ async function main() {
   console.log('\nAGENT MOCK TEST PASSED ✅');
   server.close();
   await hub.stop();
-  paper.close();
+  await paper.close();
   process.exit(0);
 }
 

@@ -178,6 +178,7 @@ function buildAccountTools(ctx: ToolContext): Record<string, ToolDef> {
       parameters: z.object({}),
       execute: async () => {
         const marks = ctx.markPrices();
+        await paper.sync(marks);
         const acc = paper.getAccount(marks);
         const positions = paper.markPositions(marks);
         return {
@@ -234,7 +235,7 @@ async function executePlaceOrder(args: any, ctx: ToolContext): Promise<unknown> 
   if (!check.approved) return { error: check.reason, checks: check.checks };
 
   try {
-    const res = paper.placeMarketOrder(symbol, side, qty, px, { leverage, reason, clientOrderId });
+    const res = await paper.placeMarketOrder(symbol, side, qty, px, { leverage, reason, clientOrderId });
     return {
       ok: true, orderId: res.id, symbol, side, qty, fillPrice: round(res.price, 2), notional: round(res.notional, 2), fee: round(res.fee, 3), realizedPnl: round(res.realizedPnl, 2), reduceOnly: res.reduceOnly,
       position: res.position ? { side: res.position.side, qty: round(res.position.qty, 4), entryPrice: round(res.position.entryPrice, 2), leverage: round(res.position.leverage, 2) } : null,
@@ -275,7 +276,7 @@ function buildTradingTools(ctx: ToolContext): Record<string, ToolDef> {
         if (!p) return { error: `no open position in ${s}` };
         const marks = ctx.markPrices();
         const px = marks[s] ?? p.entryPrice;
-        const res = ctx.paper.placeMarketOrder(s, p.side === 'LONG' ? 'SELL' : 'BUY', p.qty, px, { reason: `CLOSE: ${String(reason).slice(0, 400)}` });
+        const res = await ctx.paper.placeMarketOrder(s, p.side === 'LONG' ? 'SELL' : 'BUY', p.qty, px, { reason: `CLOSE: ${String(reason).slice(0, 400)}` });
         return { ok: true, symbol: s, closedSide: p.side, qty: round(p.qty, 4), exitPrice: round(res.price, 2), realizedPnl: round(res.realizedPnl, 2), fee: round(res.fee, 3), equityAfter: round(res.equity, 2) };
       },
     },

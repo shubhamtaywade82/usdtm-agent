@@ -2,16 +2,12 @@
  * Smoke test — verifies the full stack without requiring Ollama.
  */
 import assert from 'node:assert';
-import fs from 'node:fs';
 import { config } from './config.js';
 import { MarketDataHub } from './market-data-hub.js';
 import { PaperExchange } from './paper-exchange.js';
 import { RiskManager } from './risk.js';
 import { createTools, toOllamaTools } from './tools.js';
 import { snapshot as indicatorSnapshot } from './indicators.js';
-
-const DB = 'data/smoke-test.db';
-for (const suffix of ['', '-wal', '-shm']) fs.rmSync(DB + suffix, { force: true });
 
 let passed = 0;
 const ok = (name: string) => { passed++; console.log(`  ✅ ${name}`); };
@@ -53,10 +49,11 @@ function testRiskCaps(risk: RiskManager, marks: Record<string, number>) {
   ok('per-trade risk cap enforced');
 }
 
-function testRisk() {
+async function testRisk() {
   console.log('— RiskManager');
-  const px = new PaperExchange(DB + '.risk');
-  fs.rmSync(DB + '.risk', { force: true });
+  const px = new PaperExchange({ accountId: 'usdtm-agent-risk' });
+  await px.init();
+  await px.resetAccount(10000);
   const risk = new RiskManager(px);
   try {
     const marks = { BTCUSDT: 65000 };
@@ -80,18 +77,18 @@ function testRisk() {
     risk.setHalt(false, '', true);
     assert.ok(risk.checkOrder({ symbol: 'BTCUSDT', side: 'BUY', qty: 0.002, price: 65000, leverage: 1, reason: 't' }, marks).approved);
     ok('manual halt + ack resume');
-    px.close();
+    await px.close();
   } catch (err) {
     fail('risk manager', err);
   }
 }
 
-function testPaperRoundTrip(px: PaperExchange) {
+async function testPaperRoundTrip(px: PaperExchange) {
   const acc0 = px.getAccount({ BTCUSDT: 65000 });
   assert.strictEqual(acc0.equity, config.paper.initialBalance);
   ok('initial account');
 
-  const fill1 = px.placeMarketOrder('BTCUSDT', 'BUY', 0.01, 65000, { leverage: 2, reason: 'smoke: open long' });
+  const fill1 = await px.placeMarketOrder('BTCUSDT', 'BUY', 0.01, 65000, { leverage: 2, reason: 'smoke: open long' });
   assert.strictEqual(fill1.status, 'FILLED');
   assert.ok(fill1.position && fill1.position.side === 'LONG');
   const acc1 = px.getAccount({ BTCUSDT: 65000 });
@@ -103,54 +100,57 @@ function testPaperRoundTrip(px: PaperExchange) {
   assert.ok(Math.abs(acc2.equity - (acc1.equity + 0.01 * 1000)) < 1e-6);
   ok('mark-to-market');
 
-  px.placeMarketOrder('BTCUSDT', 'BUY', 0.01, 64000, { leverage: 2, reason: 'smoke: add' });
+  await px.placeMarketOrder('BTCUSDT', 'BUY', 0.01, 64000, { leverage: 2, reason: 'smoke: add' });
   const pos = px.getPosition('BTCUSDT')!;
   assert.ok(Math.abs(pos.qty - 0.02) < 1e-9);
   ok('average in (position increase)');
 
-  const r1 = px.placeMarketOrder('BTCUSDT', 'SELL', 0.01, 65000, { reason: 'smoke: partial close' });
+  const r1 = await px.placeMarketOrder('BTCUSDT', 'SELL', 0.01, 65000, { reason: 'smoke: partial close' });
   assert.ok(r1.reduceOnly && r1.realizedPnl > 0);
   ok('partial close with realized PnL');
 
-  const r2 = px.placeMarketOrder('BTCUSDT', 'SELL', 0.01, 65500, { reason: 'smoke: full close' });
+  const r2 = await px.placeMarketOrder('BTCUSDT', 'SELL', 0.01, 65500, { reason: 'smoke: full close' });
   assert.strictEqual(px.getPosition('BTCUSDT'), null);
   assert.ok(r2.realizedPnl > 0);
   ok('full close');
 }
 
-function testPaperLifecycle(px: PaperExchange) {
-  px.placeMarketOrder('ETHUSDT', 'SELL', 0.2, 3000, { leverage: 2, reason: 'smoke: open short' });
-  const r3 = px.placeMarketOrder('ETHUSDT', 'BUY', 0.2, 2900, { reason: 'smoke: close short' });
+async function testPaperLifecycle(px: PaperExchange) {
+  await px.placeMarketOrder('ETHUSDT', 'SELL', 0.2, 3000, { leverage: 2, reason: 'smoke: open short' });
+  const r3 = await px.placeMarketOrder('ETHUSDT', 'BUY', 0.2, 2900, { reason: 'smoke: close short' });
   assert.ok(r3.realizedPnl > 0);
   ok('short round trip');
 
-  px.placeMarketOrder('BTCUSDT', 'BUY', 0.01, 65000, { leverage: 2, reason: 'smoke: reopen' });
+  await px.placeMarketOrder('BTCUSDT', 'BUY', 0.01, 65000, { leverage: 2, reason: 'smoke: reopen' });
   const before = px.getAccount().balance;
-  const amt = px.settleFunding('BTCUSDT', 0.0001, 65000);
+  const amt = await px.settleFunding('BTCUSDT', 0.0001, 65000);
   assert.ok(amt < 0 && px.getAccount().balance < before);
   ok('funding settlement');
 
   const liqPos = px.markPositions({});
   assert.ok(liqPos[0].liquidationPrice !== null);
-  const liqs = px.checkLiquidations({ BTCUSDT: liqPos[0].liquidationPrice! * 0.5 });
+  const liqs = await px.checkLiquidations({ BTCUSDT: liqPos[0].liquidationPrice! * 0.5 });
   assert.strictEqual(liqs.length, 1);
   assert.strictEqual(px.getPosition('BTCUSDT'), null);
   ok('liquidation engine');
 
-  px.placeMarketOrder('SOLUSDT', 'BUY', 1, 100, { leverage: 1, reason: 'smoke: persist' });
-  px.close();
-  const px2 = new PaperExchange(DB);
+  await px.placeMarketOrder('SOLUSDT', 'BUY', 1, 100, { leverage: 1, reason: 'smoke: persist' });
+  await px.close();
+  const px2 = new PaperExchange({ accountId: 'usdtm-agent-smoke' });
+  await px2.init();
   assert.ok(px2.getPosition('SOLUSDT') !== null);
-  ok('SQLite persistence across restart');
-  px2.close();
+  ok('paper_exchange persistence across client restart');
+  await px2.close();
 }
 
 async function testPaperExchange() {
   console.log('— PaperExchange');
-  const px = new PaperExchange(DB);
+  const px = new PaperExchange({ accountId: 'usdtm-agent-smoke' });
+  await px.init();
+  await px.resetAccount(10000);
   try {
-    testPaperRoundTrip(px);
-    testPaperLifecycle(px);
+    await testPaperRoundTrip(px);
+    await testPaperLifecycle(px);
   } catch (err) {
     fail('paper exchange', err);
   }
@@ -189,7 +189,9 @@ async function testHubLive() {
 async function testTools() {
   console.log('— Tools (with live hub where possible)');
   const hub = new MarketDataHub();
-  const px = new PaperExchange(DB + '.tools');
+  const px = new PaperExchange({ accountId: 'usdtm-agent-tools' });
+  await px.init();
+  await px.resetAccount(10000);
   const risk = new RiskManager(px);
   const markPrices = () => ({ BTCUSDT: hub.getPrice('BTCUSDT') ?? 65000 });
   const tools = createTools({ hub, paper: px, risk, markPrices, setPlanNote: () => {} });
@@ -235,7 +237,7 @@ async function testTools() {
     ok('zod → JSON Schema for Ollama tools API');
 
     await hub.stop();
-    px.close();
+    await px.close();
   } catch (err) {
     try { await hub.stop(); } catch {}
     fail('tools', err);
@@ -245,7 +247,7 @@ async function testTools() {
 async function main() {
   console.log('Smoke test — agentic USDT-M paper trader\n');
   testIndicators();
-  testRisk();
+  await testRisk();
   await testPaperExchange();
   await testHubLive();
   await testTools();
