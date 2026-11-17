@@ -77,6 +77,16 @@ async function testRisk() {
     risk.setHalt(false, '', true);
     assert.ok(risk.checkOrder({ symbol: 'BTCUSDT', side: 'BUY', qty: 0.002, price: 65000, leverage: 1, reason: 't' }, marks).approved);
     ok('manual halt + ack resume');
+
+    await px.placeMarketOrder('BTCUSDT', 'BUY', 0.1, 70000, { leverage: 3, reason: 'smoke: over-cap position' });
+    const overCap = { BTCUSDT: 70000, ETHUSDT: 3000 };
+    const newSym = risk.checkOrder({ symbol: 'ETHUSDT', side: 'BUY', qty: 0.6667, price: 3000, leverage: 3, reason: 't' }, overCap);
+    assert.strictEqual(newSym.checks.find((c) => c.name === 'portfolio_notional_cap')?.pass, false);
+    ok('portfolio cap counts the order being checked (new symbol)');
+    assert.ok(risk.checkOrder({ symbol: 'BTCUSDT', side: 'SELL', qty: 0.1, price: 70000, leverage: 1, reason: 't' }, overCap).approved);
+    ok('reduce order approved while over exposure caps');
+    assert.strictEqual(risk.checkOrder({ symbol: 'BTCUSDT', side: 'SELL', qty: 0.2, price: 70000, leverage: 1, reason: 't' }, overCap).approved, false);
+    ok('oversized opposite-side order gets entry checks (no flip-through-reduce)');
     await px.close();
   } catch (err) {
     fail('risk manager', err);

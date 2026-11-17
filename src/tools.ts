@@ -275,7 +275,8 @@ function buildTradingTools(ctx: ToolContext): Record<string, ToolDef> {
         const p = ctx.paper.getPosition(s);
         if (!p) return { error: `no open position in ${s}` };
         const marks = ctx.markPrices();
-        const px = marks[s] ?? p.entryPrice;
+        const px = marks[s];
+        if (px === undefined) return { error: `no mark price for ${s}; refusing to close at an unknown price` };
         const res = await ctx.paper.placeMarketOrder(s, p.side === 'LONG' ? 'SELL' : 'BUY', p.qty, px, { reason: `CLOSE: ${String(reason).slice(0, 400)}` });
         return { ok: true, symbol: s, closedSide: p.side, qty: round(p.qty, 4), exitPrice: round(res.price, 2), realizedPnl: round(res.realizedPnl, 2), fee: round(res.fee, 3), equityAfter: round(res.equity, 2) };
       },

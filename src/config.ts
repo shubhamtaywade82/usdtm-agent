@@ -90,8 +90,6 @@ export const config = {
     restTimeoutMs: envNum('REST_TIMEOUT_MS', 8_000),
     /** Binance fapi REST base. */
     restBase: envStr('REST_BASE', 'https://fapi.binance.com'),
-    /** Testnet base for smoke tests / dry runs. */
-    testnetRestBase: envStr('TESTNET_REST_BASE', 'https://testnet.binancefuture.com'),
   },
 } as const;
 

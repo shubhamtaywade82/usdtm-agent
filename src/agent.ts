@@ -20,6 +20,8 @@ export interface CycleResult {
 
 interface ToolCallEntry { name: string; argsKey: string; at: number; }
 
+const ORDER_TOOLS = new Set(['place_market_order', 'close_position']);
+
 const SYSTEM_PROMPT = `You are a disciplined autonomous crypto trading agent running a USDT-M perpetual futures PAPER account.
 
 You interact with the world ONLY through tools. You receive live market data from Binance USDT-M futures (WebSocket): prices, order book, mark price, funding, open interest, long/short ratios, liquidations.
@@ -100,6 +102,21 @@ export class Agent {
     return window.some((t) => countIdentical(t) >= 4);
   }
 
+  // Zod validation at the boundary: omitted optional args get their defaults, bad ones are reported back to the model.
+  private async runTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+    const tool = this.tools[name];
+    if (!tool) return { error: `unknown tool: ${name}` };
+    if (name === 'place_market_order' && !this.planNote) {
+      return { error: 'no plan this cycle: call set_plan before place_market_order' };
+    }
+    const parsed = tool.parameters.safeParse(args);
+    if (!parsed.success) {
+      const issues = parsed.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`).join('; ');
+      return { error: `invalid arguments: ${issues}` };
+    }
+    return tool.execute(parsed.data);
+  }
+
   private async executeTool(call: any): Promise<{ name: string; content: string }> {
     const name = call.function?.name ?? '';
     let args: Record<string, unknown> = {};
@@ -108,15 +125,14 @@ export class Agent {
     } else {
       args = call.function?.arguments ?? {};
     }
-    if (name === 'place_market_order' || name === 'close_position') this.orderCountThisCycle++;
 
     let result: unknown;
     try {
-      const tool = this.tools[name];
-      result = tool ? await tool.execute(args) : { error: `unknown tool: ${name}` };
+      result = await this.runTool(name, args);
     } catch (err: unknown) {
       result = { error: err instanceof Error ? err.message : String(err) };
     }
+    if (ORDER_TOOLS.has(name) && (result as { ok?: boolean } | undefined)?.ok) this.orderCountThisCycle++;
     let content: string;
     try { content = JSON.stringify(result); } catch { content = JSON.stringify({ error: 'unserializable result' }); }
     return { name, content: content.length > 4000 ? content.slice(0, 4000) + '…(truncated)' : content };

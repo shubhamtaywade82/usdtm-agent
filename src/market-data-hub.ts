@@ -34,24 +34,18 @@ export class MarketDataHub extends EventEmitter {
   private l2Books = new Map<string, FuturesOrderBook>();
   private bookEngine!: ReturnType<BinanceClient['createFuturesOrderBookEngine']>;
 
+  // Mainnet only: a testnet snapshot would seed a mainnet stream with the wrong book.
   private async fetchDepthSnapshot(symbol: string): Promise<{ lastUpdateId: number; bids: [string, string][]; asks: [string, string][] }> {
-    const bases = [config.marketData.restBase, config.marketData.testnetRestBase];
-    let lastErr: unknown;
-    for (const base of bases) {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), config.marketData.restTimeoutMs);
-      try {
-        const r = await fetch(`${base}/fapi/v1/depth?symbol=${symbol}&limit=1000`, { signal: ctrl.signal });
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const j = await r.json() as { lastUpdateId: number; bids: [string, string][]; asks: [string, string][] };
-        return { lastUpdateId: j.lastUpdateId, bids: j.bids, asks: j.asks };
-      } catch (err) {
-        lastErr = err;
-      } finally {
-        clearTimeout(timer);
-      }
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), config.marketData.restTimeoutMs);
+    try {
+      const r = await fetch(`${config.marketData.restBase}/fapi/v1/depth?symbol=${symbol}&limit=1000`, { signal: ctrl.signal });
+      if (!r.ok) throw new Error(`depth snapshot HTTP ${r.status}`);
+      const j = await r.json() as { lastUpdateId: number; bids: [string, string][]; asks: [string, string][] };
+      return { lastUpdateId: j.lastUpdateId, bids: j.bids, asks: j.asks };
+    } finally {
+      clearTimeout(timer);
     }
-    throw lastErr instanceof Error ? lastErr : new Error('depth snapshot failed');
   }
 
   private setupWsListeners(): void {
@@ -194,7 +188,7 @@ export class MarketDataHub extends EventEmitter {
 
   async getKlines(symbol: string, interval: string, limit = 100): Promise<Kline[]> {
     const live = this.getCachedKlines(symbol, interval).filter((k) => k.closed);
-    if (live.length >= Math.min(limit, 30)) return live.slice(-limit);
+    if (live.length >= limit) return live.slice(-limit);
     try {
       const raw = await this.cached(`klines:${symbol}:${interval}:${limit}`, config.marketData.restCacheMs, () => this.client.futures.market.klines(symbol, interval as any, { limit }));
       return raw.map((k: any) => ({
@@ -236,7 +230,6 @@ export class MarketDataHub extends EventEmitter {
   getSymbolRules(symbol: string) {
     return this.cached(`rules:${symbol}`, 3600_000, () => this.client.futures.market.instrumentDetails(symbol));
   }
-  get facade(): BinanceClient { return this.client; }
 
   async stop(): Promise<void> {
     try {

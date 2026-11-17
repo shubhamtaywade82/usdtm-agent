@@ -4,7 +4,7 @@
  */
 import { Decimal } from 'decimal.js';
 import { config } from './config.js';
-import type { PaperOrder, PaperPosition, PositionSide, Side } from './types.js';
+import type { PaperOrder, PaperPosition, Side } from './types.js';
 
 export interface AccountState {
   balance: number; available: number; equity: number; marginUsed: number;
@@ -126,6 +126,8 @@ export class PaperExchange {
   async init(): Promise<void> {
     await this.ensureLease();
     await this.sync();
+    // Server exposes no day-start equity, so the breaker re-anchors at each startup.
+    this.accountState.dayStartEquity = this.accountState.equity;
   }
 
   private rollDayIfNeeded(currentEquity: number, now = new Date()): void {

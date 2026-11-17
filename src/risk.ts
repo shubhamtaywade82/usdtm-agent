@@ -26,6 +26,12 @@ export interface RiskCheckResult {
 
 interface DoomEntry { key: string; at: number; }
 
+// Oversized opposite-side orders would flip the position, so they get full entry checks.
+// Tolerance covers the model seeing qty rounded to 4 decimals in get_portfolio.
+const QTY_ROUNDING_TOLERANCE = 1e-4;
+const isReducing = (req: OrderRequest, sameSym?: PaperPosition): boolean =>
+  !!sameSym && sameSym.side !== (req.side === 'BUY' ? 'LONG' : 'SHORT') && req.qty <= sameSym.qty + QTY_ROUNDING_TOLERANCE;
+
 export class RiskManager {
   private halted = false;
   private haltReason = '';
@@ -96,11 +102,11 @@ export class RiskManager {
     const { req, notional, acc, positions, markPrices } = ctx;
     const sameSym = positions.find((p) => p.symbol === req.symbol);
     const increasingExisting = !!sameSym && sameSym.side === (req.side === 'BUY' ? 'LONG' : 'SHORT');
-    const projectedNotional = increasingExisting ? sameSym.qty * markPrices[sameSym.symbol] + notional : notional;
+    const projectedNotional = increasingExisting ? sameSym.qty * (markPrices[sameSym.symbol] ?? sameSym.entryPrice) + notional : notional;
     const posCap = acc.equity * (config.paper.maxPositionNotionalPct / 100);
     checks.push({ name: 'position_notional_cap', pass: projectedNotional <= posCap, detail: `projected $${projectedNotional.toFixed(0)} vs cap $${posCap.toFixed(0)}` });
 
-    const totalProjected = positions.reduce((s, p) => s + (markPrices[p.symbol] ?? p.entryPrice) * p.qty, 0) + (increasingExisting ? notional : 0);
+    const totalProjected = positions.reduce((s, p) => s + (markPrices[p.symbol] ?? p.entryPrice) * p.qty, 0) + notional;
     const portCap = acc.equity * (config.paper.maxPortfolioNotionalPct / 100);
     checks.push({ name: 'portfolio_notional_cap', pass: totalProjected <= portCap, detail: `projected $${totalProjected.toFixed(0)} vs cap $${portCap.toFixed(0)}` });
   }
@@ -110,14 +116,16 @@ export class RiskManager {
     checks: RiskCheckResult['checks']
   ): void {
     const { req, notional, acc, sameSym } = ctx;
+    const isReduce = isReducing(req, sameSym);
     const lev = Math.min(req.leverage ?? 1, config.paper.maxLeverage);
     const fee = notional * (config.paper.takerFeeBps / 10_000);
     const required = notional / lev + fee;
-    checks.push({ name: 'margin_available', pass: required <= acc.available, detail: `need $${required.toFixed(2)}, available $${acc.available.toFixed(2)}` });
+    if (!isReduce) {
+      checks.push({ name: 'margin_available', pass: required <= acc.available, detail: `need $${required.toFixed(2)}, available $${acc.available.toFixed(2)}` });
+    }
 
     let riskPass = true;
     let riskDetail = 'no stop distance given (opening without stop — allowed but discouraged)';
-    const isReduce = !!sameSym && sameSym.side !== (req.side === 'BUY' ? 'LONG' : 'SHORT');
     if (!isReduce && req.stopDistancePct != null && req.stopDistancePct > 0) {
       const riskUsd = notional * (req.stopDistancePct / 100);
       const riskCap = acc.equity * (config.paper.maxRiskPerTradePct / 100);
@@ -139,7 +147,8 @@ export class RiskManager {
     const sameSym = positions.find((p) => p.symbol === req.symbol);
 
     this.checkBasicSanity(req, checks);
-    this.checkNotionalCaps({ req, notional, acc, positions, markPrices }, checks);
+    // Reducing exposure must stay possible even when the account is over its caps.
+    if (!isReducing(req, sameSym)) this.checkNotionalCaps({ req, notional, acc, positions, markPrices }, checks);
     this.checkMarginAndRisk({ req, notional, acc, sameSym }, checks);
 
     const allPass = checks.every((c) => c.pass);
@@ -148,12 +157,5 @@ export class RiskManager {
       return { approved: false, reason: `RISK REJECTED: ${failed}`, checks };
     }
     return { approved: true, reason: 'approved', checks };
-  }
-
-  maxQtyFor(symbol: string, price: number, leverage: number, markPrices: Record<string, number>): number {
-    const acc = this.paper.getAccount(markPrices);
-    const posCap = acc.equity * (config.paper.maxPositionNotionalPct / 100);
-    const marginCap = acc.available / (1 / Math.min(leverage, config.paper.maxLeverage) + config.paper.takerFeeBps / 10_000);
-    return Math.max(0, Math.min(posCap, marginCap)) / price;
   }
 }

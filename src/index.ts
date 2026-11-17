@@ -84,6 +84,7 @@ async function main(): Promise<void> {
     } finally {
       cycleRunning = false;
       lastCycleEnd = Date.now();
+      flushPending(); // run any trigger coalesced while this cycle was busy
     }
   };
 
