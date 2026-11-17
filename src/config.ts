@@ -31,6 +31,11 @@ function envList(key: string, dflt: string[]): string[] {
   if (v === undefined || v.trim() === '') return dflt;
   return v.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
 }
+function envBool(key: string, dflt: boolean): boolean {
+  const v = process.env[key];
+  if (v === undefined || v.trim() === '') return dflt;
+  return v.trim() === 'true' || v.trim() === '1';
+}
 
 export const config = {
   ollama: {
@@ -40,6 +45,8 @@ export const config = {
     numCtx: envNum('AGENT_NUM_CTX', 8192),
     temperature: envNum('AGENT_TEMPERATURE', 0.2),
     requestTimeoutMs: envNum('AGENT_REQUEST_TIMEOUT_MS', 120_000),
+    numPredict: envNum('AGENT_NUM_PREDICT', 2048),
+    think: envBool('AGENT_THINK', false),
   },
   symbols: envList('SYMBOLS', ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']),
   paper: {
@@ -48,6 +55,7 @@ export const config = {
     accountId: envStr('PAPER_EXCHANGE_ACCOUNT_ID', 'usdtm-agent'),
     holderId: envStr('PAPER_EXCHANGE_HOLDER_ID', 'usdtm-agent-runner'),
     initialBalance: envNum('INITIAL_BALANCE', 10_000),
+    leaseTtlSeconds: envNum('PAPER_LEASE_TTL_SECONDS', 120),
     /** Hard leverage cap — orders that would exceed it are rejected. */
     maxLeverage: envNum('MAX_LEVERAGE', 3),
     /** Max notional per symbol as % of equity. */

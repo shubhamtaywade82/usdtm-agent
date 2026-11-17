@@ -42,13 +42,10 @@ export class PaperExchange {
     this.accountId = opts.accountId ?? config.paper.accountId;
     this.holderId = opts.holderId ?? config.paper.holderId;
     const init = config.paper.initialBalance;
-    this.accountState = {
-      balance: init, available: init, equity: init, marginUsed: 0,
-      dayStartEquity: init, realizedPnlToday: 0, dayStartTs: Date.now(),
-    };
+    this.accountState = { balance: init, available: init, equity: init, marginUsed: 0, dayStartEquity: init, realizedPnlToday: 0, dayStartTs: Date.now() };
   }
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async request<T>(method: string, path: string, body?: unknown, isRetry = false): Promise<T> {
     const headers: Record<string, string> = { 'Content-Type': 'application/json', 'X-Account-Id': this.accountId };
     if (this.apiKey) headers['X-API-Key'] = this.apiKey;
     if (this.fence !== null) {
@@ -58,11 +55,20 @@ export class PaperExchange {
     const res = await fetch(`${this.baseUrl}${path}`, {
       method, headers, body: body !== undefined ? JSON.stringify(body) : undefined,
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status} ${method} ${path}: ${await res.text()}`);
+    if (!res.ok) {
+      const text = await res.text();
+      // Auto-recover from lost/superseded lease on mutating requests.
+      if (res.status === 409 && text.includes('lease_lost') && !isRetry && path !== '/account/lease') {
+        this.fence = null;
+        await this.acquireLease();
+        return this.request<T>(method, path, body, true);
+      }
+      throw new Error(`HTTP ${res.status} ${method} ${path}: ${text}`);
+    }
     return res.json() as Promise<T>;
   }
 
-  async acquireLease(ttlSeconds = 30): Promise<number> {
+  async acquireLease(ttlSeconds = config.paper.leaseTtlSeconds): Promise<number> {
     try {
       const data = await this.request<{ fence: number }>('POST', '/account/lease', {
         holder_id: this.holderId, holder_label: this.accountId, ttl_seconds: ttlSeconds,
@@ -79,11 +85,21 @@ export class PaperExchange {
     }
   }
 
-  async heartbeatLease(ttlSeconds = 60): Promise<void> {
-    if (this.fence === null) return;
-    await this.request('POST', '/account/lease', {
-      holder_id: this.holderId, holder_label: this.accountId, ttl_seconds: ttlSeconds,
-    });
+  async heartbeatLease(ttlSeconds = config.paper.leaseTtlSeconds): Promise<void> {
+    if (this.fence === null) {
+      await this.acquireLease(ttlSeconds);
+      return;
+    }
+    try {
+      const data = await this.request<{ fence: number }>('PUT', '/account/lease', { ttl_seconds: ttlSeconds });
+      if (data?.fence !== undefined) this.fence = data.fence;
+    } catch (err: any) {
+      const msg = String(err?.message ?? '');
+      if (msg.includes('lease_lost') || msg.includes('lease_required')) {
+        this.fence = null;
+        await this.acquireLease(ttlSeconds);
+      }
+    }
   }
 
   async releaseLease(): Promise<void> {
@@ -95,7 +111,7 @@ export class PaperExchange {
 
   private startHeartbeatTimer(): void {
     if (this.heartbeatTimer) return;
-    this.heartbeatTimer = setInterval(() => { void this.heartbeatLease().catch(() => {}); }, 20_000);
+    this.heartbeatTimer = setInterval(() => { void this.heartbeatLease().catch(() => {}); }, 15_000);
     this.heartbeatTimer.unref();
   }
 
@@ -127,11 +143,8 @@ export class PaperExchange {
     const marginUsed = Number(acc.locked_margin ?? acc.wallet?.locked ?? 0);
     const balance = new Decimal(available).plus(marginUsed).toNumber();
     const equity = Number(acc.equity ?? acc.current_equity ?? balance);
-    const realizedPnl = Number(acc.realized_pnl ?? 0);
     this.rollDayIfNeeded(equity);
-    this.accountState = {
-      ...this.accountState, balance, available, equity, marginUsed, realizedPnlToday: realizedPnl,
-    };
+    this.accountState = { ...this.accountState, balance, available, equity, marginUsed, realizedPnlToday: Number(acc.realized_pnl ?? 0) };
   }
 
   private updateCachedPositions(posList: any[]): void {
@@ -140,15 +153,12 @@ export class PaperExchange {
     for (const p of list) {
       const qty = Number(p.quantity ?? p.net_quantity ?? 0);
       if (qty <= 0) continue;
-      const entryPrice = Number(p.entry_price ?? p.average_price ?? 0);
-      const leverage = Number(p.leverage ?? 1);
-      const margin = Number(p.margin_used ?? p.initial_margin ?? 0);
       const rawSide = String(p.side ?? 'long').toUpperCase();
-      const side: PositionSide = rawSide === 'BUY' || rawSide === 'LONG' ? 'LONG' : 'SHORT';
-      const liq = p.liquidation_price ? Number(p.liquidation_price) : null;
       this.positions.set(p.symbol, {
-        symbol: p.symbol, side, qty, entryPrice, leverage, margin,
-        unrealizedPnl: Number(p.unrealized_pnl ?? 0), liquidationPrice: liq,
+        symbol: p.symbol, side: rawSide === 'BUY' || rawSide === 'LONG' ? 'LONG' : 'SHORT',
+        qty, entryPrice: Number(p.entry_price ?? p.average_price ?? 0), leverage: Number(p.leverage ?? 1),
+        margin: Number(p.margin_used ?? p.initial_margin ?? 0), unrealizedPnl: Number(p.unrealized_pnl ?? 0),
+        liquidationPrice: p.liquidation_price ? Number(p.liquidation_price) : null,
         openedAt: p.opened_at ? new Date(p.opened_at).getTime() : Date.now(),
       });
     }
@@ -177,14 +187,11 @@ export class PaperExchange {
   getPosition(symbol: string): PaperPosition | null { return this.positions.get(symbol) ?? null; }
 
   markPositions(markPrices: Record<string, number>): (PaperPosition & { unrealizedPnl: number; liquidationPrice: number | null })[] {
+    const mmr = config.paper.maintenanceMarginRate / 100;
     return this.getPositions().map((p) => {
       const mark = markPrices[p.symbol] ?? p.entryPrice;
-      const dir = p.side === 'LONG' ? 1 : -1;
-      const unrealizedPnl = new Decimal(mark).minus(p.entryPrice).times(p.qty).times(dir).toNumber();
-      const mmr = config.paper.maintenanceMarginRate / 100;
-      const fallbackLiq = p.side === 'LONG'
-        ? p.entryPrice * (1 - (1 / p.leverage) + mmr)
-        : p.entryPrice * (1 + (1 / p.leverage) - mmr);
+      const unrealizedPnl = new Decimal(mark).minus(p.entryPrice).times(p.qty).times(p.side === 'LONG' ? 1 : -1).toNumber();
+      const fallbackLiq = p.side === 'LONG' ? p.entryPrice * (1 - (1 / p.leverage) + mmr) : p.entryPrice * (1 + (1 / p.leverage) - mmr);
       return { ...p, unrealizedPnl, liquidationPrice: p.liquidationPrice ?? (Number.isFinite(fallbackLiq) ? fallbackLiq : null) };
     });
   }
@@ -257,9 +264,7 @@ export class PaperExchange {
       if (p.liquidationPrice === null || mark === undefined) continue;
       const hit = p.side === 'LONG' ? mark <= p.liquidationPrice : mark >= p.liquidationPrice;
       if (hit) {
-        const res = await this.placeMarketOrder(p.symbol, p.side === 'LONG' ? 'SELL' : 'BUY', p.qty, p.liquidationPrice, {
-          reason: 'LIQUIDATION (mark crossed estimated liquidation price)', reduceOnly: true,
-        });
+        const res = await this.placeMarketOrder(p.symbol, p.side === 'LONG' ? 'SELL' : 'BUY', p.qty, p.liquidationPrice, { reason: 'LIQUIDATION', reduceOnly: true });
         out.push({ symbol: p.symbol, realizedPnl: res.realizedPnl });
       }
     }

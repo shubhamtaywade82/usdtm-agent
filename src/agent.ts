@@ -168,7 +168,12 @@ export class Agent {
         messages,
         tools: this.toolDefs,
         stream: false,
-        options: { temperature: config.ollama.temperature, num_ctx: config.ollama.numCtx },
+        think: config.ollama.think,
+        options: {
+          temperature: config.ollama.temperature,
+          num_ctx: config.ollama.numCtx,
+          num_predict: config.ollama.numPredict,
+        },
       }),
       new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error(`Ollama request timeout after ${config.ollama.requestTimeoutMs}ms`)), config.ollama.requestTimeoutMs),
