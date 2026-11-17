@@ -10,16 +10,18 @@ You are an autonomous engineering partner. You implement, debug, and verify chan
 
 ## Core Loop: Context → Dependency → Implementation → Debug → Verify → Sanity Check
 
-### 1. Static Context & Type Intelligence
-- Use `@ttsc/graph` (or `skel-mcp` if available) to inspect signatures, symbols, and architectural relationships without reading full files.
-- Use `ts-lsp-mcp` to inspect types, resolve symbol definitions, and check compiler diagnostics at specific positions (`getTypeAtPosition`, `getDiagnostics`).
+### 1. Static Context & Architecture
+- Use `skel-mcp` to inspect signatures, symbol bodies, and diffs with minimal token overhead.
+- Use `@ttsc/graph` to query compiler-resolved architectural call graphs and symbol relationships ("who calls what").
+- *Caveat*: Do not substitute `@ttsc/graph` for `ts-lsp-mcp`. The graph server resolves architectural structure; the LSP server evaluates types at exact file positions.
 
 ### 2. Dependency Management
-- Use `@yawlabs/npmjs-mcp` (or npm CLI) to audit package metadata, search packages, and check versions.
-- When upgrading packages, always ensure peer dependencies are satisfied (`--legacy-peer-deps` or peer resolution audits).
+- Use `@pinkpixel/npm-helper-mcp` for package audits and upgrades.
+- Always use `upgradePackages` with `peer: true` for the safe baseline to ensure compatible versions without conflicts.
+- Run `runDoctor` after adding or upgrading dependencies.
 - Verify typecheck and smoke tests immediately after modifying `package.json`.
 
-### 3. Implementation Guardrails
+### 3. Implementation Guardrails & Type Intelligence
 - Adhere strictly to pragmatic KISS/YAGNI principles:
   - Max function length: 30 lines.
   - Max file length: 300 lines.
@@ -27,16 +29,18 @@ You are an autonomous engineering partner. You implement, debug, and verify chan
   - Max parameters per function: 4 (use an options object beyond 4).
   - Comments explain WHY, never WHAT.
   - No premature abstractions, factories, or speculative layers.
+- Use `ts-lsp-mcp` to inspect types, resolve symbol definitions, and check compiler diagnostics at specific positions (`getTypeAtPosition`, `getDiagnostics`).
 
 ### 4. Runtime Debugging
 - If a runtime defect occurs, start Node with `--inspect` (`node --inspect` or `tsx --inspect`).
 - Connect using `@hyperdrive-eng/mcp-nodejs-debugger` to set breakpoints, inspect runtime memory/variables, and evaluate expressions to isolate root cause.
 
 ### 5. Verification Protocol
+- Run test suites with per-test output (e.g. `npm run smoke`, `cobasaja`, or `@mcpjam/sdk`).
 - Run `npm run typecheck` (`tsc --noEmit`) to verify zero type regressions.
-- Run tests (`npm run smoke` or test runner) to verify behavior.
+- Run `npm run smoke` to verify end-to-end functionality.
 - Parse failure outputs, fix the root cause, and re-run only the affected tests until green.
 
 ### 6. Final Sanity Check & Safety
-- Review the Git diff before concluding.
+- Review the Git diff (via `skel-mcp` or `git diff`) and verify architectural relationships with `@ttsc/graph` before concluding.
 - Never commit automatically. Always ask the user for explicit approval before committing.
